@@ -1,0 +1,10 @@
+menu "Ticos Agent Configuration"
+
+    config TICOS_SERVER
+        string "Ticos Server URL"
+        default "wss://api.ticos.ai/v1/realtime"
+        help
+            URL of the Ticos server to connect to.
+            Default is the official Ticos server.
+
+endmenu
