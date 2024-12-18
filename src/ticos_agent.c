@@ -24,9 +24,7 @@ static ticos_message_handler message_handler_cb = NULL;
 #define AUDIO_QUEUE_SIZE 20
 #define AUDIO_TASK_STACK_SIZE 4096
 
-// static const char *server_host = CONFIG_TICOS_SERVER;
-// static const char *server_host = "ws://192.168.31.95:8765/v1/realtime";
-static const char *server_host = "ws://192.168.20.188:8765/v1/realtime";
+static const char *server_host = CONFIG_TICOS_SERVER;
 
 typedef struct {
     uint8_t *data;
