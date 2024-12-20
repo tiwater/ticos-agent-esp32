@@ -1,4 +1,5 @@
 #include "ticos_agent.h"
+#include "ticos_audio.h"
 #include "esp_websocket_client.h"
 #include "esp_log.h"
 #include "cJSON.h"
@@ -7,83 +8,16 @@
 #include "mbedtls/base64.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "cJSON.h"
 
 static const char *TAG = "TicosAgent";
 static esp_websocket_client_handle_t client = NULL;
-static QueueHandle_t send_audio_queue = NULL;
-static QueueHandle_t send_queue = NULL;
-static TaskHandle_t audio_task_handle = NULL;
-static TaskHandle_t send_task_handle = NULL;
-
 static QueueHandle_t parse_message_queue = NULL;
 static TaskHandle_t message_task_handle = NULL;
-
 static ticos_message_handler message_handler_cb = NULL;
-
-#define AUDIO_QUEUE_SIZE 20
-#define AUDIO_TASK_STACK_SIZE 4096
 
 static const char *server_host = CONFIG_TICOS_SERVER;
 
-typedef struct {
-    uint8_t *data;
-    size_t len;
-} audio_data_t;
-
-// Encoding task to convert raw data to base64 and enqueuing it for sending
-static void encode_audio_task(void *pvParameters) {
-    audio_data_t audio_data;
-    while (true) {
-        if (xQueueReceive(send_audio_queue, &audio_data, portMAX_DELAY)) {
-            size_t base64_len;
-            mbedtls_base64_encode(NULL, 0, &base64_len, audio_data.data, audio_data.len);
-            char *base64_audio = (char *)malloc(base64_len + 1);
-            if (base64_audio) {
-                int ret = mbedtls_base64_encode((unsigned char *)base64_audio, base64_len + 1, &base64_len, audio_data.data, audio_data.len);
-                if (ret == 0) {
-                    base64_audio[base64_len] = '\0';
-                    if (xQueueSend(send_queue, &base64_audio, portMAX_DELAY) != pdPASS) {
-                        ESP_LOGE(TAG, "Failed to queue base64 audio data");
-                        free(base64_audio);
-                    }
-                } else {
-                    ESP_LOGE(TAG, "Base64 encoding failed");
-                    free(base64_audio);
-                }
-            } else {
-                ESP_LOGE(TAG, "Memory allocation failed for base64_audio");
-            }
-            free(audio_data.data);
-        }
-    }
-}
-
-// Sending task for sending JSON wrapped base64 audio data over websocket
-static void send_audio_task(void *pvParameters) {
-    char *base64_audio;
-    while (true) {
-        if (xQueueReceive(send_queue, &base64_audio, portMAX_DELAY)) {
-            const char *json_fmt = "{\"type\":\"message\",\"content\":{\"type\":\"audio\",\"audio\":\"%s\"}}";
-            size_t json_msg_len = strlen(json_fmt) + strlen(base64_audio);
-            char *json_msg = (char *)malloc(json_msg_len);
-            if (json_msg) {
-                snprintf(json_msg, json_msg_len, json_fmt, base64_audio);
-                if (!esp_websocket_client_send_text(client, json_msg, strlen(json_msg), portMAX_DELAY)) {
-                    ESP_LOGE(TAG, "Failed to send audio message");
-                }
-                free(json_msg);
-            } else {
-                ESP_LOGE(TAG, "Failed to allocate memory for JSON message");
-            }
-            free(base64_audio);
-        }
-    }
-}
-
-
 void process_message_str(const char *str) {
-
     // TODO: For evaluation we use base64 encoded audio data. We expect raw data in real situation to ease the embedded device.
     cJSON *json = cJSON_Parse(str);
     if(json){
@@ -161,8 +95,14 @@ bool rtc_send_config_update(esp_websocket_client_handle_t client) {
     }
 
     bool success = esp_websocket_client_send_text(client, message_str, strlen(message_str), portMAX_DELAY);
+    if (!success) {
+        ESP_LOGE(TAG, "Failed to send config update message");
+    }
+    ESP_LOGI(TAG, "Sent config update message!");
+
     cJSON_free(message_str);
     cJSON_Delete(message);
+
     return success;
 }
 
@@ -180,8 +120,14 @@ bool rtc_send_hello_message(esp_websocket_client_handle_t client) {
     }
 
     bool success = esp_websocket_client_send_text(client, message_str, strlen(message_str), portMAX_DELAY);
+    if (!success) {
+        ESP_LOGE(TAG, "Failed to send hello message");
+    }
+    ESP_LOGI(TAG, "Sent hello message!");
+
     cJSON_free(message_str);
     cJSON_Delete(message);
+
     return success;
 }
 
@@ -257,8 +203,6 @@ static void process_message_task(void *pvParameters) {
 }
 
 bool init_ticos_agent() {
-    ESP_LOGI(TAG, "Init websocket client against %s", server_host);
-
     esp_websocket_client_config_t websocket_cfg = {
         .uri = server_host,
         .cert_pem = NULL, // Add root CA certificate if needed
@@ -267,57 +211,47 @@ bool init_ticos_agent() {
         .reconnect_timeout_ms = 10000,
         .task_stack = 1024 * 16,
     };
-    
+
     client = esp_websocket_client_init(&websocket_cfg);
     if (!client) {
-        ESP_LOGE(TAG, "Failed to initialize websocket client");
+        ESP_LOGE(TAG, "Failed to init websocket client");
+        return false;
+    }
+
+    if (!init_ticos_audio(client)) {
+        ESP_LOGE(TAG, "Failed to init audio module");
+        esp_websocket_client_destroy(client);
+        return false;
+    }
+
+    parse_message_queue = xQueueCreate(10, sizeof(char*));
+    if (!parse_message_queue) {
+        ESP_LOGE(TAG, "Failed to create message queue");
+        deinit_ticos_audio();
+        esp_websocket_client_destroy(client);
+        return false;
+    }
+
+    BaseType_t ret = xTaskCreate(process_message_task, "message_task", 4096, NULL, 5, &message_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create message task");
+        vQueueDelete(parse_message_queue);
+        deinit_ticos_audio();
+        esp_websocket_client_destroy(client);
         return false;
     }
 
     if (esp_websocket_client_start(client) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start websocket client");
+        vTaskDelete(message_task_handle);
+        vQueueDelete(parse_message_queue);
+        deinit_ticos_audio();
         esp_websocket_client_destroy(client);
-        client = NULL;
         return false;
     }
 
     esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
-    
-    // Initialize queues and tasks
-    send_audio_queue = xQueueCreate(AUDIO_QUEUE_SIZE, sizeof(audio_data_t));
-    send_queue = xQueueCreate(AUDIO_QUEUE_SIZE, sizeof(char*));
-    
-    xTaskCreate(encode_audio_task, "encode_audio_task", AUDIO_TASK_STACK_SIZE, NULL, 5, &audio_task_handle);
-    xTaskCreate(send_audio_task, "send_audio_task", AUDIO_TASK_STACK_SIZE, NULL, 5, &send_task_handle);
 
-
-    parse_message_queue = xQueueCreate(AUDIO_QUEUE_SIZE, sizeof(char*)); 
-    xTaskCreate(process_message_task, "process_message_task", AUDIO_TASK_STACK_SIZE, NULL, 5, &message_task_handle);
-    
-    return true;
-}
-
-bool send_audio(uint8_t *data, size_t len) {
-    if (!client || !esp_websocket_client_is_connected(client)) {
-        return false;
-    }
-
-    audio_data_t audio_data = {
-        .data = malloc(len),
-        .len = len
-    };
-    
-    if (!audio_data.data) {
-        return false;
-    }
-    
-    memcpy(audio_data.data, data, len);
-    
-    if (xQueueSend(send_audio_queue, &audio_data, 0) != pdPASS) {
-        free(audio_data.data);
-        return false;
-    }
-    
     return true;
 }
 
@@ -365,37 +299,23 @@ bool deinit_ticos_agent() {
         esp_websocket_client_stop(client);
         esp_websocket_client_destroy(client);
         client = NULL;
-        
-        if (audio_task_handle) {
-            vTaskDelete(audio_task_handle);
-            audio_task_handle = NULL;
-        }
+    }
 
-        if (send_task_handle) {
-            vTaskDelete(send_task_handle);
-            send_task_handle = NULL;
-        }
+    deinit_ticos_audio();
 
-        vQueueDelete(send_audio_queue);
-        send_audio_queue = NULL;
+    if (message_task_handle) {
+        vTaskDelete(message_task_handle);
+        message_task_handle = NULL;
+    }
 
-        vQueueDelete(send_queue);
-        send_queue = NULL;
-
-        if (message_task_handle) {
-            vTaskDelete(message_task_handle);
-            message_task_handle = NULL;
-        }
-
+    if (parse_message_queue) {
         vQueueDelete(parse_message_queue);
         parse_message_queue = NULL;
     }
+
     return true;
 }
 
-
-
-// Register a callback function to handle messages from server
 bool register_message_handler(ticos_message_handler handler) {
     if (handler == NULL) {
         return false;
