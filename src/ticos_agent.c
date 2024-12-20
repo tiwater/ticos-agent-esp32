@@ -15,6 +15,8 @@ static QueueHandle_t parse_message_queue = NULL;
 static TaskHandle_t message_task_handle = NULL;
 static ticos_message_handler message_handler_cb = NULL;
 
+#define MESSAGE_QUEUE_SIZE 100
+
 static const char *server_host = CONFIG_TICOS_SERVER;
 
 void process_message_str(const char *str) {
@@ -176,9 +178,15 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
                 if (buffer && buffer_len == expected_payload_len) {
                     buffer[buffer_len] = '\0';
-                    // ESP_LOGI(TAG, "Received a complete package");
+                    // Show message count in the queue
+                    int delay = 0;
+                    while(uxQueueMessagesWaiting(parse_message_queue) >= MESSAGE_QUEUE_SIZE && delay < 10){
+                        vTaskDelay(pdMS_TO_TICKS(1));
+                        delay ++;
+                    }
                     if (xQueueSend(parse_message_queue, &buffer, 0) != pdTRUE) {
-                        ESP_LOGE(TAG, "Failed to send buffer to audio queue");
+                        // Strange, if remove the uxQueueMessagesWaiting here will cause send fail sometime
+                        ESP_LOGE(TAG, "Failed to send buffer to message queue and queue size: %d", uxQueueMessagesWaiting(parse_message_queue));
                         free(buffer);
                     }
                     buffer = NULL;
@@ -224,7 +232,7 @@ bool init_ticos_agent() {
         return false;
     }
 
-    parse_message_queue = xQueueCreate(10, sizeof(char*));
+    parse_message_queue = xQueueCreate(MESSAGE_QUEUE_SIZE, sizeof(char*));
     if (!parse_message_queue) {
         ESP_LOGE(TAG, "Failed to create message queue");
         deinit_ticos_audio();
@@ -308,7 +316,12 @@ bool deinit_ticos_agent() {
         message_task_handle = NULL;
     }
 
+    // Free elements in parse_message_queue
     if (parse_message_queue) {
+        char *buffer;
+        while (xQueueReceive(parse_message_queue, &buffer, 0) == pdTRUE) {
+            free(buffer);
+        }
         vQueueDelete(parse_message_queue);
         parse_message_queue = NULL;
     }

@@ -119,11 +119,23 @@ void deinit_ticos_audio(void) {
         vTaskDelete(send_task_handle);
         send_task_handle = NULL;
     }
+    
+    // Free elements in send_audio_queue
     if (send_audio_queue) {
+        audio_data_t audio_data;
+        while (xQueueReceive(send_audio_queue, &audio_data, 0) == pdTRUE) {
+            free(audio_data.data);
+        }
         vQueueDelete(send_audio_queue);
         send_audio_queue = NULL;
     }
+
+    // Free elements in send_queue (contains base64 encoded strings)
     if (send_queue) {
+        char *base64_audio;
+        while (xQueueReceive(send_queue, &base64_audio, 0) == pdTRUE) {
+            free(base64_audio);
+        }
         vQueueDelete(send_queue);
         send_queue = NULL;
     }
